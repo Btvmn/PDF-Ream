@@ -134,6 +134,30 @@ func writeVectorPDF(to url: URL, pageCount: Int) {
     try! (data as Data).write(to: url)
 }
 
+/// A long text document: every page saved on its own repeats the embedded font, which is what
+/// makes a naive per-page size estimate several times too high.
+func writeBookPDF(to url: URL, pageCount: Int) {
+    let data = NSMutableData()
+    var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+    let ctx = CGContext(consumer: CGDataConsumer(data: data as CFMutableData)!, mediaBox: &box, nil)!
+    let font = CTFontCreateWithName("Georgia" as CFString, 11, nil)
+    for page in 1...pageCount {
+        ctx.beginPDFPage(nil)
+        for line in 0..<48 {
+            let text = "Page \(page) line \(line + 1): Sphinx of black quartz, judge my vow; \(page * 97 + line * 13) — ÄÖÜ àéî ßø"
+            let attributed = NSAttributedString(string: text, attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+            ])
+            ctx.textPosition = CGPoint(x: 54, y: 740 - CGFloat(line) * 14.5)
+            CTLineDraw(CTLineCreateWithAttributedString(attributed), ctx)
+        }
+        ctx.endPDFPage()
+    }
+    ctx.closePDF()
+    try! (data as Data).write(to: url)
+}
+
 guard CommandLine.arguments.count > 1 else {
     print("usage: make_fixtures <output-dir>")
     exit(2)
@@ -207,7 +231,46 @@ writeScanPDF(to: out.appendingPathComponent("single.pdf"),
 try! Data((0..<4096).map { _ in UInt8.random(in: 0...255) }).write(to: out.appendingPathComponent("broken.pdf"))
 try! "not a pdf".data(using: .utf8)!.write(to: out.appendingPathComponent("notes.txt"))
 
-for name in ["scan20.pdf", "noise2.pdf", "rotated.pdf", "vector6.pdf", "annotated.pdf", "single.pdf"] {
+// Bookmarks, internal links and document information: they must survive Merge and Compress.
+// Four text pages around one heavy scan, so compressing it under a few MB has to re-render a page.
+// Pages: 1 text, 2 text, 3 scan, 4 text, 5 text.
+let structuredURL = out.appendingPathComponent("structured.pdf")
+writeVectorPDF(to: structuredURL, pageCount: 4)
+if let doc = PDFDocument(url: structuredURL),
+   let scan = PDFDocument(url: out.appendingPathComponent("single.pdf"))?.page(at: 0)?.copy() as? PDFPage {
+    doc.insert(scan, at: 2)
+    func page(_ number: Int) -> PDFPage { doc.page(at: number - 1)! }
+    func destination(_ number: Int) -> PDFDestination { PDFDestination(page: page(number), at: CGPoint(x: 0, y: 842)) }
+    func link(from: Int, to: Int, asAction: Bool) {
+        let annotation = PDFAnnotation(bounds: CGRect(x: 60, y: 40, width: 240, height: 24), forType: .link, withProperties: nil)
+        if asAction { annotation.action = PDFActionGoTo(destination: destination(to)) } else { annotation.destination = destination(to) }
+        page(from).addAnnotation(annotation)
+    }
+    link(from: 1, to: 4, asAction: false)
+    link(from: 2, to: 3, asAction: true)
+    link(from: 5, to: 1, asAction: false)
+
+    let root = PDFOutline()
+    func bookmark(_ label: String, _ number: Int, under parent: PDFOutline) -> PDFOutline {
+        let item = PDFOutline()
+        item.label = label
+        item.destination = destination(number)
+        parent.insertChild(item, at: parent.numberOfChildren)
+        return item
+    }
+    _ = bookmark("Intro", 1, under: root)
+    let scanItem = bookmark("Scan", 3, under: root)
+    _ = bookmark("Details", 4, under: scanItem)
+    _ = bookmark("End", 5, under: root)
+    doc.outlineRoot = root
+    doc.documentAttributes = [PDFDocumentAttribute.titleAttribute: "Structured fixture",
+                              PDFDocumentAttribute.authorAttribute: "PDF Ream tests"]
+    doc.write(to: structuredURL)
+}
+
+writeBookPDF(to: out.appendingPathComponent("text40.pdf"), pageCount: 40)
+
+for name in ["scan20.pdf", "noise2.pdf", "rotated.pdf", "vector6.pdf", "annotated.pdf", "single.pdf", "structured.pdf", "text40.pdf"] {
     let url = out.appendingPathComponent(name)
     let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
     print("\(name): \(size) bytes, \(PDFDocument(url: url)?.pageCount ?? 0) pages")

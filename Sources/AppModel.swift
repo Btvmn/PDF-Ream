@@ -109,7 +109,11 @@ final class AppModel: ObservableObject {
     @Published var queue: [QueuedFile] = []
     /// A modal panel pumps the runloop, so guard against drops and a second Run landing mid-panel.
     @Published var isPresentingPanel = false
-    @Published var isWorking = false
+    /// While a job runs the window cannot be closed: closing the last window quits the app,
+    /// and that would stop the job halfway. Quitting asks first (see AppDelegate).
+    @Published var isWorking = false {
+        didSet { Self.setWindowsClosable(!isWorking) }
+    }
     @Published var progress: Double = 0
     @Published var progressLabel = ""
     @Published var status: Status?
@@ -122,25 +126,43 @@ final class AppModel: ObservableObject {
         didSet { Self.defaults.set(fileLimitMB, forKey: "fileLimitMB") }
     }
     /// What the size field shows; parsed on every keystroke so a drop right after typing uses the new value.
+    /// Out-of-range numbers are clamped; the field shows the clamped value on Return and on Run.
     @Published var limitText = "" {
         didSet {
-            guard limitText != oldValue, let parsed = Self.parseNumber(limitText), parsed > 0 else { return }
-            setLimit(min(parsed, 2000))
+            guard limitText != oldValue, let parsed = Self.parseNumber(limitText), parsed.isFinite, parsed > 0 else { return }
+            setLimit(min(max(parsed, Self.limitRange.lowerBound), Self.limitRange.upperBound))
         }
     }
 
+    nonisolated static let limitRange: ClosedRange<Double> = 0.1...2000
+
     #if UITEST
-    /// Test runs keep their own preferences domain instead of the user's.
-    nonisolated static let defaults = UserDefaults(suiteName: "pdfream.uitest") ?? .standard
+    /// Test runs keep their preferences in a file of their own in the per-user temporary folder
+    /// (a suite named by an absolute path), so they never touch ~/Library/Preferences.
+    static let defaults = UserDefaults(suiteName: AppModel.testDefaultsName) ?? .standard
+    nonisolated static let testDefaultsName = NSTemporaryDirectory() + "pdfream-uitest-defaults"
     #else
-    nonisolated static let defaults = UserDefaults.standard
+    static let defaults = UserDefaults.standard
     #endif
 
     init() {
         let defaults = Self.defaults
-        pageLimitMB = defaults.object(forKey: "pageLimitMB") as? Double ?? 2
-        fileLimitMB = defaults.object(forKey: "fileLimitMB") as? Double ?? 10
+        pageLimitMB = Self.validLimit(defaults.object(forKey: "pageLimitMB") as? Double) ?? 2
+        fileLimitMB = Self.validLimit(defaults.object(forKey: "fileLimitMB") as? Double) ?? 10
         limitText = Self.formatNumber(pageLimitMB)
+    }
+
+    /// A stored limit is used only if it is a sane number; anything else falls back to the default.
+    nonisolated static func validLimit(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, limitRange.contains(value) else { return nil }
+        return value
+    }
+
+    private static func setWindowsClosable(_ closable: Bool) {
+        guard let app = NSApp else { return }
+        for window in app.windows where window.canBecomeMain {
+            window.standardWindowButton(.closeButton)?.isEnabled = closable
+        }
     }
 
     var activeLimitMB: Double { mode == .split ? pageLimitMB : fileLimitMB }
@@ -201,6 +223,7 @@ final class AppModel: ObservableObject {
     func enqueue(_ urls: [URL], at index: Int?, note: String? = nil) {
         var added: [QueuedFile] = []
         var rejected: [String] = []
+        var restricted: [String] = []
         for url in urls {
             guard let doc = PDFDocument(url: url) else {
                 rejected.append("“\(url.lastPathComponent)” cannot be opened")
@@ -214,14 +237,22 @@ final class AppModel: ObservableObject {
                 rejected.append("“\(url.lastPathComponent)” has no pages")
                 continue
             }
+            // Opens without a password but carries an owner password: the rewritten files will not keep its limits.
+            if doc.isEncrypted && (!doc.allowsPrinting || !doc.allowsCopying) {
+                restricted.append("“\(url.lastPathComponent)”")
+            }
             added.append(QueuedFile(url: url, pages: doc.pageCount, bytes: PDFEngine.fileSize(of: url)))
         }
         let position = min(max(index ?? queue.count, 0), queue.count)
         queue.insert(contentsOf: added, at: position)
 
-        // Two separate sentences: rejected files and skipped non-PDFs are different problems.
+        // Separate sentences: rejected files, restricted files and skipped non-PDFs are different matters.
         var parts: [String] = []
         if !rejected.isEmpty { parts.append("Not added: " + rejected.joined(separator: ", ") + ".") }
+        if !restricted.isEmpty {
+            parts.append("Printing and copying restrictions in " + restricted.joined(separator: ", ")
+                         + " are not kept in files PDF Ream rewrites.")
+        }
         if let note { parts.append(note) }
         if !parts.isEmpty { status = Status(kind: .warning, text: parts.joined(separator: " ")) }
     }
@@ -238,19 +269,33 @@ final class AppModel: ObservableObject {
     // MARK: - Actions
 
     private func runSplit(_ files: [URL]) {
-        var jobs: [(source: URL, folder: URL)] = []
+        /// `replacing`: an existing folder the save panel was told to replace. The pages go into a
+        /// sibling folder first, and the swap happens only once they are all written.
+        var jobs: [(source: URL, folder: URL, replacing: URL?)] = []
         if files.count == 1 {
             let source = files[0]
             guard let folder = chooseFolderURL(name: "\(source.deletingPathExtension().lastPathComponent) (pages)",
                                                near: source) else { return }
-            jobs = [(source, folder)]
+            if let problem = Self.replacementProblem(folder, holding: source) {
+                status = Status(kind: .failure, text: problem)
+                return
+            }
+            if FileManager.default.fileExists(atPath: folder.path) {
+                var taken = Set<String>()
+                let staging = Self.uniqueURL(folder.deletingLastPathComponent()
+                    .appendingPathComponent("\(folder.lastPathComponent) (in progress)"), isFolder: true, taken: &taken)
+                jobs = [(source, staging, folder)]
+            } else {
+                jobs = [(source, folder, nil)]
+            }
         } else {
             guard let directory = chooseDirectory(near: files[0],
                                                   message: "Each file gets its own folder of pages.")
             else { return }
             var taken = Set<String>()
             jobs = files.map { source in
-                (source, Self.uniqueURL(directory.appendingPathComponent("\(source.deletingPathExtension().lastPathComponent) (pages)"), taken: &taken))
+                (source, Self.uniqueURL(directory.appendingPathComponent("\(source.deletingPathExtension().lastPathComponent) (pages)"),
+                                        isFolder: true, taken: &taken), nil)
             }
         }
 
@@ -261,37 +306,51 @@ final class AppModel: ObservableObject {
             var lines: [String] = []
             var errors: [String] = []
             var folders: [URL] = []
+            var processed: [URL] = []
             var warning = false
             for (index, job) in jobs.enumerated() {
                 do {
                     let result = try PDFEngine.split(source: job.source, into: job.folder, pageLimit: limit) { value in
                         self?.report((Double(index) + value) / Double(jobs.count))
                     }
-                    folders.append(result.folder)
+                    var folder = result.folder
+                    if let target = job.replacing {
+                        do {
+                            try Self.moveToTrash(target)
+                            try FileManager.default.moveItem(at: job.folder, to: target)
+                            folder = target
+                        } catch {
+                            errors.append("Could not replace “\(target.lastPathComponent)”: \(error.localizedDescription) "
+                                          + "The new pages are in “\(job.folder.lastPathComponent)”.")
+                        }
+                    }
+                    folders.append(folder)
+                    processed.append(job.source)
                     let largest = result.sizes.max() ?? 0
-                    var line = "\(Self.plural(result.files.count, "page", "pages")) → “\(job.folder.lastPathComponent)”"
+                    var line = "\(Self.plural(result.files.count, "page", "pages")) → “\(folder.lastPathComponent)”"
                     if jobs.count > 1 { line = "“\(job.source.lastPathComponent)”: " + line }
                     lines.append(line)
                     if jobs.count == 1 {
                         // Detail lines only for a single file: a 20-file batch would bury the window.
-                        if result.compressedPages.isEmpty {
-                            lines.append("Every page was already under \(limitText) — copied without recompression.")
-                        } else {
+                        if !result.compressedPages.isEmpty {
                             lines.append("Compressed pages: \(result.compressedPages.count). Largest file: \(Self.formatSize(largest)).")
+                        } else if result.overLimitPages.isEmpty {
+                            lines.append("Every page was already under \(limitText) — copied without recompression.")
                         }
                     }
                     if !result.overLimitPages.isEmpty {
                         warning = true
                         let pages = result.overLimitPages.map(String.init).joined(separator: ", ")
-                        lines.append("Could not fit within \(limitText): pages \(pages) — saved at the lowest quality.")
+                        lines.append("Could not fit within \(limitText): pages \(pages) — saved as small as they would go.")
                     }
                 } catch {
                     errors.append(error.localizedDescription)
                 }
             }
             let reveal = folders
+            let done = processed
             Task { @MainActor in
-                self?.finish(lines: lines, errors: errors, warning: warning,
+                self?.finish(lines: lines, errors: errors, warning: warning, processed: done,
                              actions: reveal.isEmpty ? [] : [
                                 StatusAction(title: reveal.count == 1 ? "Open Folder" : "Show in Finder") {
                                     if reveal.count == 1 {
@@ -301,7 +360,6 @@ final class AppModel: ObservableObject {
                                     }
                                 }
                              ])
-                if errors.isEmpty { self?.queue.removeAll() }
             }
         }
     }
@@ -327,6 +385,7 @@ final class AppModel: ObservableObject {
     /// The action button: this is the only place that asks for a destination and starts work.
     func run() {
         guard canRun else { return }
+        syncLimitText()
 
         // The queue may have been staged long ago; a file can be gone by now.
         let missing = queue.filter { !FileManager.default.fileExists(atPath: $0.url.path) }
@@ -359,6 +418,7 @@ final class AppModel: ObservableObject {
             var lines: [String] = []
             var errors: [String] = []
             var outputs: [URL] = []
+            var processed: [URL] = []
             var warning = false
             for (index, job) in jobs.enumerated() {
                 do {
@@ -366,24 +426,28 @@ final class AppModel: ObservableObject {
                         self?.report((Double(index) + value) / Double(jobs.count))
                     }
                     outputs.append(result.output)
+                    processed += job.sources
                     let name = "“\(result.output.lastPathComponent)”"
                     if combinesSources {
                         lines.append("\(Self.plural(job.sources.count, "file", "files")) → \(name): \(Self.plural(result.pageCount, "page", "pages")), \(Self.formatSize(result.bytes)).")
                     } else {
                         lines.append("\(name): \(Self.formatSize(result.inputBytes)) → \(Self.formatSize(result.bytes)).")
                     }
-                    if !result.recompressed {
-                        lines.append("Fits within \(limitText) without recompression — quality untouched.")
+                    if result.fitsLimit && !result.recompressed {
+                        lines.append("Already within \(limitText) — nothing was recompressed.")
                     }
                     if !result.fitsLimit {
                         warning = true
-                        lines.append("Even at the lowest quality it does not fit within \(limitText).")
+                        lines.append(result.recompressed
+                            ? "Even at the lowest quality it does not fit within \(limitText)."
+                            : "It does not fit within \(limitText), and recompressing would not make it smaller, so the pages were kept as they are.")
                     }
                 } catch {
                     errors.append(error.localizedDescription)
                 }
             }
             let saved = outputs
+            let done = processed
             Task { @MainActor in
                 var actions: [StatusAction] = []
                 if saved.count == 1 {
@@ -392,8 +456,7 @@ final class AppModel: ObservableObject {
                 if !saved.isEmpty {
                     actions.append(StatusAction(title: "Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting(saved) })
                 }
-                self?.finish(lines: lines, errors: errors, warning: warning, actions: actions)
-                if errors.isEmpty { self?.queue.removeAll() }
+                self?.finish(lines: lines, errors: errors, warning: warning, processed: done, actions: actions)
             }
         }
     }
@@ -413,9 +476,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func finish(lines: [String], errors: [String], warning: Bool, actions: [StatusAction]) {
+    /// Files that were processed leave the queue; the ones that failed stay, so a second press
+    /// retries only them instead of redoing the whole batch.
+    private func finish(lines: [String], errors: [String], warning: Bool, processed: [URL], actions: [StatusAction]) {
         isWorking = false
         progress = 1
+        let done = Set(processed)
+        queue.removeAll { done.contains($0.url) }
         var text = lines.joined(separator: "\n")
         if !errors.isEmpty {
             let problems = errors.joined(separator: "\n")
@@ -437,6 +504,18 @@ final class AppModel: ObservableObject {
     /// Makes a scripted panel behave as if the user pressed Cancel.
     nonisolated(unsafe) static var scriptedCancel = false
 
+    /// Drops the test preferences and their file once a test run is over.
+    static func removeTestDefaults() {
+        defaults.removePersistentDomain(forName: testDefaultsName)
+        defaults.synchronize()
+        try? FileManager.default.removeItem(atPath: testDefaultsName + ".plist")
+    }
+
+    /// Runs while a scripted panel is "open", so a test can try to drop files or press Run behind it.
+    nonisolated(unsafe) static var duringPanel: (@MainActor () -> Void)?
+    /// Test runs move replaced folders here instead of into the user's Trash.
+    nonisolated(unsafe) static var scriptedTrash: URL?
+
     /// Lets a test drive an app launched by Finder, which cannot set properties in-process.
     /// NSTemporaryDirectory() is per-user, unlike a shared /tmp path.
     nonisolated static let scriptedURLFile = ProcessInfo.processInfo.environment["PDFREAM_UITEST_SAVE"]
@@ -447,14 +526,48 @@ final class AppModel: ObservableObject {
         let path = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? nil : URL(fileURLWithPath: path)
     }
+
+    /// Stands in for a modal panel: the window is busy for as long as it is "open".
+    private func scriptedPanel(_ answer: @autoclosure () -> URL?) -> URL? {
+        Self.panelRequests += 1
+        isPresentingPanel = true
+        defer { isPresentingPanel = false }
+        Self.duringPanel?()
+        return Self.scriptedCancel ? nil : answer()
+    }
     #endif
+
+    /// The save panel has already asked "Replace?". Replacing a folder of pages means starting
+    /// afresh: once the new pages are complete the old folder goes to the Trash, instead of having
+    /// new pages mixed into it. Typed over the source itself, or over a folder that holds it, the
+    /// answer is no — that would send the file being split to the Trash.
+    nonisolated static func replacementProblem(_ folder: URL, holding source: URL) -> String? {
+        guard FileManager.default.fileExists(atPath: folder.path) else { return nil }
+        let target = folder.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping.lowercased()
+        let original = source.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping.lowercased()
+        if original == target || original.hasPrefix(target + "/") {
+            return "“\(folder.lastPathComponent)” is or contains the file being split, so it cannot be replaced. Choose another name."
+        }
+        return nil
+    }
+
+    nonisolated static func moveToTrash(_ url: URL) throws {
+        #if UITEST
+        if let bin = scriptedTrash {
+            try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+            var taken = Set<String>()
+            let destination = uniqueURL(bin.appendingPathComponent(url.lastPathComponent), isFolder: true, taken: &taken)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return
+        }
+        #endif
+        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
 
     /// Save panel whose file name becomes a new folder for the pages.
     private func chooseFolderURL(name: String, near source: URL) -> URL? {
         #if UITEST
-        Self.panelRequests += 1
-        if Self.scriptedCancel { return nil }
-        return Self.scriptedSaveURL ?? Self.scriptedURLFromFile()
+        return scriptedPanel(Self.scriptedSaveURL ?? Self.scriptedURLFromFile())
         #else
         isPresentingPanel = true
         defer { isPresentingPanel = false }
@@ -473,9 +586,7 @@ final class AppModel: ObservableObject {
 
     private func chooseSaveURL(name: String, near source: URL, title: String) -> URL? {
         #if UITEST
-        Self.panelRequests += 1
-        if Self.scriptedCancel { return nil }
-        return Self.scriptedSaveURL ?? Self.scriptedURLFromFile()
+        return scriptedPanel(Self.scriptedSaveURL ?? Self.scriptedURLFromFile())
         #else
         isPresentingPanel = true
         defer { isPresentingPanel = false }
@@ -493,9 +604,7 @@ final class AppModel: ObservableObject {
 
     private func chooseDirectory(near source: URL, message: String) -> URL? {
         #if UITEST
-        Self.panelRequests += 1
-        if Self.scriptedCancel { return nil }
-        return Self.scriptedDirectory ?? Self.scriptedURLFromFile()
+        return scriptedPanel(Self.scriptedDirectory ?? Self.scriptedURLFromFile())
         #else
         isPresentingPanel = true
         defer { isPresentingPanel = false }
@@ -521,14 +630,17 @@ final class AppModel: ObservableObject {
         var pdfs: [URL] = []
         var skipped = 0
         let manager = FileManager.default
-        for url in urls {
+        for dropped in urls {
+            // A Finder alias or a symbolic link counts as the file or folder it points to.
+            let url = (try? URL(resolvingAliasFileAt: dropped)) ?? dropped
             var isDirectory: ObjCBool = false
             guard manager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
                 skipped += 1
                 continue
             }
             if isDirectory.boolValue {
-                let contents = manager.enumerator(at: url, includingPropertiesForKeys: nil,
+                let folder = url.resolvingSymlinksInPath()
+                let contents = manager.enumerator(at: folder, includingPropertiesForKeys: nil,
                                                   options: [.skipsHiddenFiles, .skipsPackageDescendants])?
                     .compactMap { $0 as? URL }
                     .filter { $0.pathExtension.lowercased() == "pdf" } ?? []
@@ -551,7 +663,7 @@ final class AppModel: ObservableObject {
     /// case- and normalization-insensitive, so "scan.pdf" and "Scan.pdf" would otherwise be
     /// planned as two outputs that are one file on disk, and the second would silently
     /// overwrite the first while the report claimed both were saved.
-    nonisolated static func uniqueURL(_ url: URL, taken: inout Set<String>) -> URL {
+    nonisolated static func uniqueURL(_ url: URL, isFolder: Bool = false, taken: inout Set<String>) -> URL {
         let manager = FileManager.default
         func key(_ candidate: URL) -> String {
             candidate.path.precomposedStringWithCanonicalMapping.lowercased()
@@ -563,18 +675,24 @@ final class AppModel: ObservableObject {
             taken.insert(key(url))
             return url
         }
-        let ext = url.pathExtension
-        let base = url.deletingPathExtension().lastPathComponent
+        // A folder such as "Scan 2024.01.15 (pages)" has no extension to keep apart from the number.
+        let ext = isFolder ? "" : url.pathExtension
+        let base = isFolder ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
         let folder = url.deletingLastPathComponent()
-        for suffix in 2...999 {
-            let name = ext.isEmpty ? "\(base) \(suffix)" : "\(base) \(suffix).\(ext)"
-            let candidate = folder.appendingPathComponent(name)
+        func named(_ tail: String) -> URL {
+            folder.appendingPathComponent(ext.isEmpty ? "\(base) \(tail)" : "\(base) \(tail).\(ext)")
+        }
+        for suffix in 2...9999 {
+            let candidate = named(String(suffix))
             if isFree(candidate) {
                 taken.insert(key(candidate))
                 return candidate
             }
         }
-        return url
+        // Out of numbers: a random tail still never lands on an existing name.
+        let candidate = named(UUID().uuidString)
+        taken.insert(key(candidate))
+        return candidate
     }
 
     nonisolated static func formatSize(_ bytes: Int) -> String {

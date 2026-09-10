@@ -17,14 +17,36 @@ enum UITest {
             print("usage: uitest <fixtures-dir> <work-dir>")
             exit(2)
         }
+        guard prepareWorkDirectory() else { exit(2) }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         Task { @MainActor in
             await runAll()
+            // The suite's preferences file is scratch too: remove it.
+            AppModel.removeTestDefaults()
             print("\npassed: \(passed)   failed: \(failed)")
             exit(failed == 0 ? 0 : 1)
         }
         app.run()
+    }
+
+    /// The work directory is wiped at the start of every run, so only an empty directory or one
+    /// that an earlier run marked as its own is accepted — never a checkout or a home folder.
+    static let marker = ".pdfream-uitest"
+
+    static func prepareWorkDirectory() -> Bool {
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        if manager.fileExists(atPath: work.path, isDirectory: &isDirectory) {
+            let contents = (try? manager.contentsOfDirectory(atPath: work.path)) ?? []
+            guard isDirectory.boolValue, contents.isEmpty || contents.contains(marker) else {
+                print("refusing to use \(work.path) as the work directory: it is not empty and was not made by uitest")
+                return false
+            }
+            try? manager.removeItem(at: work)
+        }
+        try? manager.createDirectory(at: work, withIntermediateDirectories: true)
+        return manager.createFile(atPath: work.appendingPathComponent(marker).path, contents: Data())
     }
 
     // MARK: - Harness
@@ -47,6 +69,8 @@ enum UITest {
         AppModel.scriptedDirectory = nil
         AppModel.scriptedCancel = false
         AppModel.panelRequests = 0
+        AppModel.duringPanel = nil
+        AppModel.scriptedTrash = work.appendingPathComponent("Trash")
     }
 
     @MainActor
@@ -106,8 +130,6 @@ enum UITest {
 
     @MainActor
     static func runAll() async {
-        try? FileManager.default.removeItem(at: work)
-        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(atPath: AppModel.scriptedURLFile)
         let model = AppModel.shared
         let scan20 = fixtures.appendingPathComponent("scan20.pdf")
@@ -186,6 +208,46 @@ enum UITest {
         check("saved exactly where the named panel said", pdfs(in: namedFolder).count == 4)
         check("offers Open Folder", status?.actions.first?.title == "Open Folder")
 
+        print("== replacing an existing folder of pages starts it afresh")
+        reset(model)
+        model.mode = .split
+        let replaceFolder = work.appendingPathComponent("replace/rotated (pages)")
+        try? FileManager.default.createDirectory(at: replaceFolder, withIntermediateDirectories: true)
+        for name in ["rotated_01.pdf", "rotated_09.pdf", "notes.txt"] {
+            FileManager.default.createFile(atPath: replaceFolder.appendingPathComponent(name).path, contents: Data("old".utf8))
+        }
+        AppModel.scriptedSaveURL = replaceFolder
+        await drop([rotated], into: model)
+        status = await runAndWait(model)
+        check("the replaced folder holds only the new pages",
+              status?.kind == .success && pdfs(in: replaceFolder).count == 4
+              && !exists(replaceFolder.appendingPathComponent("notes.txt")))
+        check("the old folder went to the Trash, not away",
+              exists(work.appendingPathComponent("Trash/rotated (pages)/notes.txt")))
+        check("no in-progress folder is left behind",
+              !exists(work.appendingPathComponent("replace/rotated (pages) (in progress)")))
+        reset(model)
+        let keptFolder = work.appendingPathComponent("keep/Doc (pages)")
+        try? FileManager.default.createDirectory(at: keptFolder, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: keptFolder.appendingPathComponent("my notes.txt").path, contents: Data("mine".utf8))
+        let doomed = copyFixture("vector6.pdf", to: work.appendingPathComponent("keep/Doc.pdf"))
+        AppModel.scriptedSaveURL = keptFolder
+        await drop([doomed], into: model)
+        try? Data("not a pdf any more".utf8).write(to: doomed)
+        status = await runAndWait(model)
+        check("a split that fails leaves the folder it would have replaced alone",
+              status?.kind == .failure && exists(keptFolder.appendingPathComponent("my notes.txt"))
+              && !exists(work.appendingPathComponent("Trash/Doc (pages)")))
+        reset(model)
+        let holder = work.appendingPathComponent("holder/Doc (pages)")
+        let inner = copyFixture("vector6.pdf", to: holder.appendingPathComponent("Doc.pdf"))
+        AppModel.scriptedSaveURL = holder
+        await drop([inner], into: model)
+        model.run()
+        await settle()
+        check("the folder holding the source is never replaced",
+              model.status?.kind == .failure && exists(inner) && !model.isWorking && model.queue.count == 1)
+
         print("== merge: order follows the list")
         reset(model)
         model.mode = .merge
@@ -249,6 +311,28 @@ enum UITest {
         check("only one panel request", AppModel.panelRequests == 1)
         check("one set of outputs", pdfs(in: doubleOut.appendingPathComponent("rotated (pages)")).count == 4)
 
+        print("== input is refused while a panel is open")
+        reset(model)
+        model.mode = .split
+        let panelOut = work.appendingPathComponent("panel-out")
+        try? FileManager.default.createDirectory(at: panelOut, withIntermediateDirectories: true)
+        AppModel.scriptedDirectory = panelOut
+        await drop([rotated, vector6], into: model)
+        var busyBehindPanel = false
+        var queuedBehindPanel = -1
+        AppModel.duringPanel = {
+            busyBehindPanel = model.isBusy && !model.canRun
+            model.handle([scan20])
+            queuedBehindPanel = model.queue.count
+            model.run()
+        }
+        status = await runAndWait(model)
+        AppModel.duringPanel = nil
+        check("an open panel makes the window busy", busyBehindPanel)
+        check("a drop behind the panel is refused", queuedBehindPanel == 2)
+        check("Run behind the panel opens no second panel", AppModel.panelRequests == 1)
+        check("the run itself completes", status?.kind == .success && model.queue.isEmpty)
+
         print("== same base name from different folders")
         reset(model)
         model.mode = .split
@@ -283,6 +367,15 @@ enum UITest {
         check("both documents survived intact",
               caseFiles.map { pdfPageCount($0) }.sorted() == [1, 4])
         check("run reported success", status?.kind == .success)
+        check("files already under the limit say so", status?.text.contains("nothing was recompressed") == true)
+
+        print("== a dotted name keeps its dots when numbered")
+        let dotted = work.appendingPathComponent("dotted")
+        try? FileManager.default.createDirectory(at: dotted.appendingPathComponent("Scan 2024.01.15 (pages)"),
+                                                 withIntermediateDirectories: true)
+        var taken = Set<String>()
+        let numbered = AppModel.uniqueURL(dotted.appendingPathComponent("Scan 2024.01.15 (pages)"), isFolder: true, taken: &taken)
+        check("the number goes after the whole folder name", numbered.lastPathComponent == "Scan 2024.01.15 (pages) 2")
 
         print("== running the same batch twice does not overwrite")
         reset(model)
@@ -311,6 +404,10 @@ enum UITest {
                   model.queue.isEmpty && model.status?.text.contains("password-protected") == true)
             check("\(mode.title): still no panel", AppModel.panelRequests == 0)
         }
+        reset(model)
+        await drop([fixtures.appendingPathComponent("restricted.pdf")], into: model)
+        check("a PDF with an owner password is queued, with a warning about its restrictions",
+              model.queue.count == 1 && model.status?.kind == .warning && model.status?.text.contains("restrictions") == true)
 
         print("== non-PDFs and folders")
         reset(model)
@@ -322,6 +419,11 @@ enum UITest {
         await drop([splitOut.appendingPathComponent("scan20 (pages)"), fixtures.appendingPathComponent("notes.txt")], into: model)
         check("folder expands to its PDFs", model.queue.count == 20)
         check("skipped non-PDF is reported", model.status?.text.contains("Skipped non-PDF files: 1.") == true)
+        reset(model)
+        let linked = work.appendingPathComponent("linked pages")
+        try? FileManager.default.createSymbolicLink(at: linked, withDestinationURL: splitOut.appendingPathComponent("scan20 (pages)"))
+        await drop([linked], into: model)
+        check("a symbolic link to a folder expands like the folder", model.queue.count == 20)
 
         print("== a file that disappears between drop and Run")
         reset(model)
@@ -349,7 +451,14 @@ enum UITest {
         status = await runAndWait(model)
         check("partial failure warns", status?.kind == .warning)
         check("the good file still produced output", pdfs(in: partialOut.appendingPathComponent("Good (pages)")).count == 6)
-        check("queue kept after a failure", model.queue.count == 2)
+        check("only the failed file stays queued", model.queue.map(\.url.lastPathComponent) == ["Bad.pdf"])
+        _ = copyFixture("vector6.pdf", to: bad)
+        AppModel.scriptedSaveURL = partialOut.appendingPathComponent("Bad (pages)")
+        status = await runAndWait(model)
+        check("a second press retries only the failed file",
+              status?.kind == .success && model.queue.isEmpty
+              && pdfs(in: partialOut.appendingPathComponent("Bad (pages)")).count == 6
+              && !exists(partialOut.appendingPathComponent("Good (pages) 2")))
 
         reset(model)
         model.mode = .compress
@@ -431,6 +540,19 @@ enum UITest {
         check("the run itself finished cleanly", status?.kind == .success)
         check("late files are not in the output", !exists(busyOut.appendingPathComponent("vector6 (pages)")))
 
+        print("== a running job keeps the window open")
+        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 240, height: 120),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.orderFront(nil)
+        model.isWorking = true
+        let closableDuringJob = window.standardWindowButton(.closeButton)?.isEnabled
+        let quitDuringJobAsks = model.isWorking   // applicationShouldTerminate would show its alert now
+        model.isWorking = false
+        check("the close button is disabled while a job runs and enabled again after",
+              closableDuringJob == false && window.standardWindowButton(.closeButton)?.isEnabled == true && quitDuringJobAsks)
+        check("quitting while idle needs no confirmation", delegate.applicationShouldTerminate(NSApp) == .terminateNow)
+        window.orderOut(nil)
+
         print("== a status stays until the next run starts")
         reset(model)
         model.mode = .split
@@ -445,5 +567,24 @@ enum UITest {
         check("page limit written through to preferences", AppModel.defaults.double(forKey: "pageLimitMB") == 3.5)
         model.limitText = "2"
         check("and updated again", AppModel.defaults.double(forKey: "pageLimitMB") == 2)
+
+        print("== the size limit stays in range")
+        reset(model)
+        model.mode = .split
+        model.limitText = "0.01"
+        check("a limit below 0.1 MB is raised to 0.1", model.pageLimitMB == 0.1)
+        model.limitText = "abc"
+        check("text that is not a number leaves the limit alone", model.pageLimitMB == 0.1)
+        model.syncLimitText()
+        check("the field shows the limit in use again", model.limitText == "0.1")
+        model.limitText = "5000"
+        check("a limit above 2000 MB is lowered to 2000", model.pageLimitMB == 2000)
+        model.limitText = "2"
+        AppModel.defaults.set(Double.nan, forKey: "fileLimitMB")
+        AppModel.defaults.set(-4.0, forKey: "pageLimitMB")
+        let fresh = AppModel()
+        check("nonsense in the preferences falls back to the defaults", fresh.pageLimitMB == 2 && fresh.fileLimitMB == 10)
+        AppModel.defaults.set(2.0, forKey: "pageLimitMB")
+        AppModel.defaults.set(10.0, forKey: "fileLimitMB")
     }
 }

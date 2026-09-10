@@ -129,6 +129,7 @@ struct QueueList: View {
                         }
                         .buttonStyle(.borderless)
                         .help("Remove from the list")
+                        .accessibilityLabel("Remove “\(item.url.lastPathComponent)” from the list")
                     }
                     .padding(.vertical, 2)
                 }
@@ -179,21 +180,27 @@ struct LimitRow: View {
 
     var body: some View {
         let isSplit = model.mode == .split
+        let range = AppModel.limitRange
         let stepperValue = Binding<Double>(
             get: { model.activeLimitMB },
             set: { value in
-                model.setLimit(min(max(value, 0.1), 2000))
+                model.setLimit(min(max(value, range.lowerBound), range.upperBound))
                 model.syncLimitText()
             }
         )
+        let accessibilityName = isSplit ? "Size limit per page, in megabytes" : "Size limit for the final file, in megabytes"
         return HStack(spacing: 8) {
             Text(isSplit ? "No more than" : "Final file no more than")
             TextField("", text: $model.limitText)
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)
                 .frame(width: 62)
-            Stepper("", value: stepperValue, in: 0.1...2000, step: isSplit ? 0.5 : 1)
+                .onSubmit { model.syncLimitText() }
+                .accessibilityLabel(accessibilityName)
+                .help("From 0.1 to 2000 MB")
+            Stepper("", value: stepperValue, in: range, step: isSplit ? 0.5 : 1)
                 .labelsHidden()
+                .accessibilityLabel(accessibilityName)
             Text(isSplit ? "MB per page" : "MB")
             Spacer()
         }
@@ -220,13 +227,13 @@ struct StatusPanel: View {
                         .foregroundStyle(status.kind.color)
                         .font(.title3)
                     VStack(alignment: .leading, spacing: 8) {
-                        ScrollView {
-                            Text(status.text)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                        // Short reports take the room they need; only a long batch report scrolls.
+                        if status.text.count > 400 || status.text.filter({ $0 == "\n" }).count >= 5 {
+                            ScrollView { message(status.text) }
+                                .frame(height: 120)
+                        } else {
+                            message(status.text)
                         }
-                        .frame(maxHeight: 120)
                         if !status.actions.isEmpty {
                             HStack {
                                 ForEach(status.actions) { action in
@@ -244,6 +251,13 @@ struct StatusPanel: View {
             }
         }
         .frame(minHeight: 46, alignment: .topLeading)
+    }
+
+    private func message(_ text: String) -> some View {
+        Text(text)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

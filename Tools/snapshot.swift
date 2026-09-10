@@ -60,10 +60,36 @@ enum Snapshot {
             model.status = nil
             await shoot(model, name: "7-split-dark", appearance: .darkAqua)
 
+            // The README pictures: real-looking names over the fixtures (hard links, no copies).
+            model.queue.removeAll()
+            model.status = nil
+            model.mode = .split
+            model.limitText = "2"
+            let named = FileManager.default.temporaryDirectory.appendingPathComponent("pdfream-readme-\(getpid())")
+            try? FileManager.default.createDirectory(at: named, withIntermediateDirectories: true)
+            var shown: [URL] = []
+            for (name, fixture) in [("Notes Scan.pdf", "scan20.pdf"), ("Lease Agreement.pdf", "rotated.pdf"), ("Passport.pdf", "single.pdf")] {
+                let link = named.appendingPathComponent(name)
+                let source = fixtures.appendingPathComponent(fixture)
+                if (try? FileManager.default.linkItem(at: source, to: link)) == nil {
+                    try? FileManager.default.copyItem(at: source, to: link)
+                }
+                shown.append(link)
+            }
+            model.enqueue(shown, at: nil)
+            model.status = nil
+            await shoot(model, name: "readme-light")
+            await shoot(model, name: "readme-dark", appearance: .darkAqua)
+            try? FileManager.default.removeItem(at: named)
+
+            // Built with -DUITEST, so preferences went to the test domain: leave nothing behind.
+            AppModel.removeTestDefaults()
             exit(0)
         }
         app.run()
     }
+
+
 
     @MainActor
     static func shoot(_ model: AppModel, name: String, appearance: NSAppearance.Name = .aqua,
@@ -74,7 +100,9 @@ enum Snapshot {
                               backing: .buffered, defer: false)
         window.title = "PDF Ream"
         window.appearance = NSAppearance(named: appearance)
-        let hosting = NSHostingView(rootView: ContentView(model: model))
+        // An offscreen window is never the active one; draw controls as in the frontmost window
+        // (accent-coloured action button), which is how people see the app.
+        let hosting = NSHostingView(rootView: ContentView(model: model).environment(\.controlActiveState, .key))
         hosting.frame = NSRect(origin: .zero, size: size)
         window.contentView = hosting
         window.setFrameOrigin(NSPoint(x: -4000, y: -4000))

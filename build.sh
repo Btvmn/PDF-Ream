@@ -39,12 +39,15 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 codesign --force --sign - --timestamp=none "$APP" || { echo "codesign failed"; exit 1; }
 
 echo "→ test tools"
-swiftc -O -swift-version 5 -parse-as-library -o "$BUILD/pdfream-cli" Sources/PDFEngine.swift Tools/cli.swift
-swiftc -O -swift-version 5 -o "$BUILD/make_fixtures" Tools/make_fixtures.swift
+# Same deployment target as the app, so the tests exercise the code paths users get.
+HOST="$(uname -m)-apple-macos13.0"
+swiftc -O -swift-version 5 -parse-as-library -target "$HOST" -o "$BUILD/pdfream-cli" Sources/PDFEngine.swift Tools/cli.swift
+swiftc -O -swift-version 5 -target "$HOST" -o "$BUILD/make_fixtures" Tools/make_fixtures.swift
 # Both harnesses declare their own @main, so PDFReamApp.swift is left out of the file list.
-swiftc -O -swift-version 5 -parse-as-library -DUITEST -o "$BUILD/uitest" \
+swiftc -O -swift-version 5 -parse-as-library -target "$HOST" -DUITEST -o "$BUILD/uitest" \
     Sources/PDFEngine.swift Sources/AppModel.swift Sources/ContentView.swift Sources/AppDelegate.swift Tools/uitest.swift
-swiftc -O -swift-version 5 -parse-as-library -o "$BUILD/snapshot" \
+# -DUITEST for snapshot too: its settings go to the temporary test preferences file, not a stray domain.
+swiftc -O -swift-version 5 -parse-as-library -target "$HOST" -DUITEST -o "$BUILD/snapshot" \
     Sources/PDFEngine.swift Sources/AppModel.swift Sources/ContentView.swift Sources/AppDelegate.swift Tools/snapshot.swift
 
 echo "done: $(pwd)/$APP  ($(lipo -archs "$APP/Contents/MacOS/PDFReam"))"

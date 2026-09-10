@@ -66,6 +66,7 @@ enum PDFEngine {
         let name = source.lastPathComponent
         let count = try validatedDocument(source).pageCount
 
+        let folderExisted = FileManager.default.fileExists(atPath: folder.path)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
@@ -85,32 +86,50 @@ enum PDFEngine {
                 failure.update { $0 = $0 ?? PDFReamError.pageFailed(name, index + 1) }
                 return
             }
-            var bytes = losslessPageData(page)
+            let lossless = losslessPageData(page)
+            let bytes: Data
             var compressed = false
             var fits = true
-            if bytes == nil || bytes!.count > pageLimit {
-                guard let fitted = bestRaster(of: page, limit: pageLimit) else {
+            if let lossless, lossless.count <= pageLimit {
+                bytes = lossless
+            } else {
+                let fitted = bestRaster(of: page, limit: pageLimit)
+                if let fitted, fitted.fits || fitted.data.count < (lossless?.count ?? .max) {
+                    bytes = fitted.data
+                    compressed = true
+                    fits = fitted.fits
+                } else if let lossless {
+                    // Rendering fails, or cannot beat the original: keep the page as is
+                    // (still vector, still selectable) and report it as over the limit.
+                    bytes = lossless
+                    fits = false
+                } else {
                     failure.update { $0 = $0 ?? PDFReamError.pageFailed(name, index + 1) }
                     return
                 }
-                bytes = fitted.data
-                compressed = true
-                fits = fitted.fits
             }
             let number = String(format: "%0\(digits)d", index + 1)
             let url = folder.appendingPathComponent("\(base)_\(number).pdf")
             do {
-                try bytes!.write(to: url, options: .atomic)
+                try bytes.write(to: url, options: .atomic)
             } catch {
                 failure.update { $0 = $0 ?? PDFReamError.writeFailed(url.lastPathComponent, error.localizedDescription) }
                 return
             }
-            outputs.update { $0[index] = PageOutput(url: url, size: bytes!.count, compressed: compressed, fits: fits) }
+            outputs.update { $0[index] = PageOutput(url: url, size: bytes.count, compressed: compressed, fits: fits) }
             let finished = done.update { $0 += 1; return $0 }
             progress(Double(finished) / Double(count))
         }
 
-        if let error = failure.value { throw error }
+        if let error = failure.value {
+            // Leave nothing half-done behind: the pages written so far go, and so does a folder
+            // made for them, but only if nothing else has landed in it meanwhile.
+            for page in outputs.value.compactMap({ $0 }) { try? FileManager.default.removeItem(at: page.url) }
+            if !folderExisted, (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.isEmpty == true {
+                try? FileManager.default.removeItem(at: folder)
+            }
+            throw error
+        }
         let pages = outputs.value.compactMap { $0 }
         return SplitResult(
             folder: folder,
@@ -153,58 +172,79 @@ enum PDFEngine {
         }
         progress(0.03)
 
-        // Size of each page kept as is: light pages (text, vector) stay untouched when that is smaller.
-        let unknownSize = 1 << 40
-        let originalSizes = Locked([Int](repeating: unknownSize, count: refs.count))
-        parallelFor(refs.count) { i in
-            guard let doc = makeDocument(sources[refs[i].doc]), let page = doc.page(at: refs[i].page),
-                  let data = losslessPageData(page) else { return }
-            originalSizes.update { $0[i] = data.count }
-        }
-        let original = originalSizes.value
+        // What keeping each page as is costs, counted two ways (see keptPageCosts).
+        let costs = keptPageCosts(refs, sources, wholeDocument: lossless.count) { progress(0.03 + 0.02 * $0) }
 
         // Every page is rendered at one shared quality level, so the document looks consistent.
-        let expectedRenders = Double(refs.count * 5)
+        let expectedRenders = Double(refs.count * 4)
         let rendered = Locked(0)
-        var levels: [Int: [Data?]] = [:]
-        func pages(at level: Int) -> [Data?] {
-            if let cached = levels[level] { return cached }
+        func renders(at level: Int) -> [Data?] {
             let result = Locked([Data?](repeating: nil, count: refs.count))
             parallelFor(refs.count) { i in
                 if let doc = makeDocument(sources[refs[i].doc]), let page = doc.page(at: refs[i].page),
-                   let data = rasterPageData(page, ladder[level]), data.count < original[i] {
+                   let data = rasterPageData(page, ladder[level]) {
                     result.update { $0[i] = data }
                 }
                 let n = rendered.update { $0 += 1; return $0 }
                 progress(min(0.95, 0.05 + 0.9 * Double(n) / expectedRenders))
             }
-            levels[level] = result.value
             return result.value
         }
-        func estimatedSize(_ pages: [Data?]) -> Int {
-            zip(pages, original).reduce(0) { $0 + ($1.0?.count ?? $1.1) }
+        func cheaper(_ renders: [Data?], than cost: [Int]) -> [Data?] {
+            zip(renders, cost).map { render, keep in render.flatMap { $0.count < keep ? $0 : nil } }
         }
 
+        // Binary search on the real size of the assembled document: the highest step that fits.
+        // A page is swapped for its render where the render costs less than keeping the page.
+        // With shared resources counted once, text pages stay text; with them counted on every
+        // page, a heavy background used by all pages can go at last — it only disappears once
+        // every page using it is rendered. The first selection that fits wins, as it keeps more
+        // pages as they were; the second is assembled only when the first does not fit.
         var low = 0, high = ladder.count - 1
-        var best = ladder.count - 1
+        var fitting: Data?
+        var lowest: [[Data?]] = []   // the selections at the lowest quality tried, for when nothing fits
         while low <= high {
             let mid = (low + high) / 2
-            if estimatedSize(pages(at: mid)) <= limit {
-                best = mid
+            let all = renders(at: mid)
+            let keepShared = cheaper(all, than: costs.shared)
+            let keepWhole = cheaper(all, than: costs.standalone)
+            let sameChoice = zip(keepShared, keepWhole).allSatisfy { ($0 == nil) == ($1 == nil) }
+            let selections = sameChoice ? [keepShared] : [keepShared, keepWhole]
+            var fitsHere: Data?
+            for selection in selections {
+                // The rendered pages alone already overshoot: it cannot fit, and assembling it would
+                // only cost time. The same page rendered twice is stored once, so renders of equal
+                // size count once (a coincidence only lowers the bound, which stays safe), and each
+                // render is credited what its file carries besides the JPEG.
+                var sizes = Set<Int>()
+                let renderedBytes = selection.reduce(0) { total, render in
+                    guard let render, sizes.insert(render.count).inserted else { return total }
+                    return total + render.count - 8192
+                }
+                if renderedBytes > limit { continue }
+                guard let data = assemble(refs, sources, raster: selection) else { throw PDFReamError.assembleFailed }
+                if data.count <= limit { fitsHere = data; break }
+            }
+            if let fitsHere {
+                fitting = fitsHere
                 high = mid - 1
             } else {
+                lowest = selections
                 low = mid + 1
             }
         }
+        if let fitting { return try save(fitting, recompressed: true) }
 
-        var level = best
-        while true {
-            guard let data = assemble(refs, sources, raster: pages(at: level)) else { throw PDFReamError.assembleFailed }
-            if data.count <= limit || level == ladder.count - 1 {
-                return try save(data, recompressed: true)
-            }
-            level += 1
+        // Nothing fits: hand back the smallest version there is, and never one larger than the input.
+        var smallest: Data?
+        for selection in lowest {
+            guard let data = assemble(refs, sources, raster: selection) else { throw PDFReamError.assembleFailed }
+            if data.count < smallest?.count ?? .max { smallest = data }
         }
+        var best = (data: smallest ?? lossless, recompressed: true)
+        if lossless.count <= best.data.count { best = (lossless, false) }
+        if sources.count == 1, inputBytes <= best.data.count { best = (try read(sources[0]), false) }
+        return try save(best.data, recompressed: best.recompressed)
     }
 
     // MARK: - Page helpers
@@ -250,6 +290,44 @@ enum PDFEngine {
         return rotation == 90 || rotation == 270 ? CGSize(width: box.height, height: box.width) : box.size
     }
 
+    /// What keeping each page as is costs, two ways. `standalone` is the page saved on its own,
+    /// which repeats everything it shares with the rest of its file (embedded fonts, a common
+    /// background, the colour profile), so a text page can look ten times heavier than it is.
+    /// `shared` takes that shared part off, estimated per source file. A page that cannot be
+    /// measured costs "infinitely much", so it is always rendered.
+    static func keptPageCosts(_ refs: [PageRef], _ sources: [URL], wholeDocument: Int,
+                              progress: (Double) -> Void) -> (standalone: [Int], shared: [Int]) {
+        let unknown = 1 << 40
+        let measured = Locked([Int?](repeating: nil, count: refs.count))
+        let counted = Locked(0)
+        parallelFor(refs.count) { i in
+            if let doc = makeDocument(sources[refs[i].doc]), let page = doc.page(at: refs[i].page),
+               let data = losslessPageData(page) {
+                measured.update { $0[i] = data.count }
+            }
+            let n = counted.update { $0 += 1; return $0 }
+            progress(Double(n) / Double(refs.count))
+        }
+        let sizes = measured.value
+        var sharedPart = [Int](repeating: 0, count: sources.count)
+        for doc in sources.indices {
+            let members = refs.indices.filter { refs[$0].doc == doc }
+            let known = members.compactMap { sizes[$0] }
+            guard members.count > 1, known.count == members.count else { continue }
+            let sum = known.reduce(0, +)
+            // Pages that share next to nothing (scans) add up to about the file itself: no need to measure.
+            let file = fileSize(of: sources[doc])
+            if file > 0, sum <= file + file / 10 { continue }
+            let together = sources.count == 1 ? wholeDocument : assemble(members.map { refs[$0] }, sources, raster: nil)?.count
+            guard let together else { continue }
+            // n pages saved separately hold the shared part n times, the whole file holds it once.
+            sharedPart[doc] = max(0, (sum - together) / (members.count - 1))
+        }
+        let standalone = sizes.map { $0 ?? unknown }
+        let shared = refs.indices.map { i in sizes[i].map { max(1, $0 - sharedPart[refs[i].doc]) } ?? unknown }
+        return (standalone, shared)
+    }
+
     /// The page on its own, without any recompression.
     static func losslessPageData(_ page: PDFPage) -> Data? {
         guard let copy = page.copy() as? PDFPage else { return nil }
@@ -293,10 +371,14 @@ enum PDFEngine {
             let size = displaySize(of: page)
             guard size.width >= 1, size.height >= 1 else { return nil }
 
-            // Pages with odd huge dimensions are rendered as if they were at most 14 inches long.
+            // One bitmap stays under ~75 MB: pages up to A3 and tabloid get the full dpi,
+            // anything larger (posters, drawings) is rendered at a proportionally lower one.
             var scale = quality.dpi / 72
+            let maxPixels: CGFloat = 18_500_000
+            let pixels = size.width * size.height * scale * scale
+            if pixels > maxPixels { scale *= (maxPixels / pixels).squareRoot() }
             let longSide = max(size.width, size.height)
-            if longSide * scale > quality.dpi * 14 { scale = quality.dpi * 14 / longSide }
+            if longSide * scale > 16_000 { scale = 16_000 / longSide }
             let width = max(1, Int((size.width * scale).rounded()))
             let height = max(1, Int((size.height * scale).rounded()))
 
@@ -334,22 +416,94 @@ enum PDFEngine {
     }
 
     /// Builds one document from the referenced pages; a non-nil `raster[i]` replaces page i.
+    /// Bookmarks and internal links are carried over and pointed at the new pages. With a single
+    /// source the document information (title, author, subject, keywords) is kept as well.
     static func assemble(_ refs: [PageRef], _ sources: [URL], raster: [Data?]?) -> Data? {
         let result = PDFDocument()
         var holders: [PDFDocument] = []
         var opened: [Int: PDFDocument] = [:]
+        var order: [Int] = []                     // source documents in order of first use
+        var placed: [Int: [Int: PDFPage]] = [:]   // source document → source page index → page in the result
+        var rendered: [Int: Set<Int>] = [:]       // source document → pages replaced by a render
+        var kept: [(source: PDFPage, copy: PDFPage, doc: Int)] = []
         for (i, ref) in refs.enumerated() {
-            let page: PDFPage?
-            if let data = raster?[i] {
-                guard let doc = PDFDocument(data: data) else { return nil }
-                holders.append(doc)
-                page = doc.page(at: 0)
-            } else {
-                if opened[ref.doc] == nil { opened[ref.doc] = makeDocument(sources[ref.doc]) }
-                page = opened[ref.doc]?.page(at: ref.page)
+            if opened[ref.doc] == nil {
+                guard let doc = makeDocument(sources[ref.doc]) else { return nil }
+                opened[ref.doc] = doc
+                order.append(ref.doc)
             }
-            guard let copy = page?.copy() as? PDFPage else { return nil }
+            guard let doc = opened[ref.doc] else { return nil }
+            let copy: PDFPage
+            if let data = raster?[i] {
+                guard let render = PDFDocument(data: data), let page = render.page(at: 0)?.copy() as? PDFPage else { return nil }
+                holders.append(render)
+                copy = page
+                rendered[ref.doc, default: []].insert(ref.page)
+            } else {
+                guard let page = doc.page(at: ref.page), let pageCopy = page.copy() as? PDFPage else { return nil }
+                copy = pageCopy
+                kept.append((page, pageCopy, ref.doc))
+            }
             result.insert(copy, at: result.pageCount)
+            placed[ref.doc, default: [:]][ref.page] = copy
+        }
+
+        func remap(_ destination: PDFDestination?, in doc: Int) -> PDFDestination? {
+            guard let destination, let page = destination.page, let source = opened[doc] else { return nil }
+            let index = source.index(for: page)
+            guard index != NSNotFound, let target = placed[doc]?[index] else { return nil }
+            // A rendered page has a coordinate space of its own: land on its top edge.
+            let point = rendered[doc]?.contains(index) == true
+                ? CGPoint(x: 0, y: target.bounds(for: .mediaBox).height) : destination.point
+            let mapped = PDFDestination(page: target, at: point)
+            mapped.zoom = destination.zoom
+            return mapped
+        }
+
+        // Copied pages keep links that still point into their source document: retarget them.
+        for page in kept {
+            let originals = page.source.annotations, copies = page.copy.annotations
+            guard originals.count == copies.count else { continue }
+            for (original, copy) in zip(originals, copies) {
+                if let mapped = remap(original.destination, in: page.doc) {
+                    copy.destination = mapped
+                } else if let goTo = original.action as? PDFActionGoTo, let mapped = remap(goTo.destination, in: page.doc) {
+                    copy.action = PDFActionGoTo(destination: mapped)
+                }
+            }
+        }
+
+        func copyOutline(_ item: PDFOutline, in doc: Int) -> PDFOutline {
+            let copy = PDFOutline()
+            copy.label = item.label
+            if let mapped = remap(item.destination, in: doc) {
+                copy.destination = mapped
+            } else if let goTo = item.action as? PDFActionGoTo, let mapped = remap(goTo.destination, in: doc) {
+                copy.action = PDFActionGoTo(destination: mapped)
+            } else if let link = item.action as? PDFActionURL, let url = link.url {
+                copy.action = PDFActionURL(url: url)
+            }
+            for index in 0..<item.numberOfChildren {
+                if let child = item.child(at: index) {
+                    copy.insertChild(copyOutline(child, in: doc), at: copy.numberOfChildren)
+                }
+            }
+            copy.isOpen = item.isOpen
+            return copy
+        }
+        let outline = PDFOutline()
+        for doc in order {
+            guard let root = opened[doc]?.outlineRoot else { continue }
+            for index in 0..<root.numberOfChildren {
+                if let child = root.child(at: index) {
+                    outline.insertChild(copyOutline(child, in: doc), at: outline.numberOfChildren)
+                }
+            }
+        }
+        if outline.numberOfChildren > 0 { result.outlineRoot = outline }
+
+        if order.count == 1, let attributes = opened[order[0]]?.documentAttributes {
+            result.documentAttributes = attributes
         }
         return withExtendedLifetime((holders, opened)) { result.dataRepresentation() }
     }

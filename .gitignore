@@ -69,3 +69,6 @@ CLAUDE.local.md
 *.swo
 *~
 tags
+
+# Release archives made by Tools/package.sh
+/dist/
